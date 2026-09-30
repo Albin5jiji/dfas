@@ -1,0 +1,14 @@
+.vscode/
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.db
+tfplan
+cloudpilot-plan.json
+cloudpilot-result.json
+.DS_Store
+uvicorn.log
+.terraform/
+*.tfplan
+tfplan.json

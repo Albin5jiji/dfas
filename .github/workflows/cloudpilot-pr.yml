@@ -1,0 +1,128 @@
+name: CloudPilot PR change review
+
+on:
+  pull_request:
+    paths:
+      - "**/*.tf"
+      - ".github/workflows/cloudpilot-pr.yml"
+      - "scripts/github_pr_feedback.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    env:
+      # Set as a GitHub Actions secret. It must be reachable from GitHub-hosted runners.
+      CLOUDPILOT_API_URL: ${{ secrets.CLOUDPILOT_API_URL }}
+      CLOUDPILOT_TF_DIRECTORY: ${{ vars.CLOUDPILOT_TF_DIRECTORY }}
+      CLOUDPILOT_ENVIRONMENT: ${{ vars.CLOUDPILOT_ENVIRONMENT || 'staging' }}
+      CLOUDPILOT_TEAM: ${{ vars.CLOUDPILOT_TEAM || 'unassigned' }}
+      CLOUDPILOT_REMAINING_BUDGET: ${{ vars.CLOUDPILOT_REMAINING_BUDGET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Create Terraform plan JSON
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${CLOUDPILOT_TF_DIRECTORY}" ] && [ -d "${CLOUDPILOT_TF_DIRECTORY}" ]; then
+            cd "${CLOUDPILOT_TF_DIRECTORY}"
+            terraform init -input=false -no-color
+            terraform plan -input=false -no-color -refresh=false -out=tfplan
+            terraform show -json tfplan > "${GITHUB_WORKSPACE}/cloudpilot-plan.json"
+          else
+            # Deterministic development path: no cloud credentials or sensitive plan values.
+            cp terraform/test-plans/multidepth-demo.json cloudpilot-plan.json
+          fi
+
+      - name: Setup Python for ephemeral API
+        if: env.CLOUDPILOT_API_URL == ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Start ephemeral CloudPilot API
+        if: env.CLOUDPILOT_API_URL == ''
+        shell: bash
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install -r requirements.txt
+          uvicorn app.main:app &
+          echo "Waiting for API to start..."
+          for i in {1..10}; do
+            curl -s http://127.0.0.1:8000/api/topology && break
+            sleep 1
+          done
+          echo "CLOUDPILOT_API_URL=http://127.0.0.1:8000" >> $GITHUB_ENV
+
+      - name: Submit plan to CloudPilot
+        id: cloudpilot
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDPILOT_API_URL}" ]; then
+            echo "CloudPilot API URL secret is not configured; deterministic plan generation completed."
+            echo "submitted=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          PYTHON_CMD="python"
+          if [ -f ".venv/bin/python" ]; then
+            PYTHON_CMD=".venv/bin/python"
+          fi
+          
+          args=(--api-url "$CLOUDPILOT_API_URL" --plan cloudpilot-plan.json --project "$GITHUB_REPOSITORY" --pull-request "${{ github.event.pull_request.number || 'manual' }}" --environment "$CLOUDPILOT_ENVIRONMENT" --team "$CLOUDPILOT_TEAM" --output cloudpilot-result.json)
+          if [ -n "${CLOUDPILOT_REMAINING_BUDGET}" ]; then
+            args+=(--remaining-budget "$CLOUDPILOT_REMAINING_BUDGET")
+          fi
+          
+          $PYTHON_CMD scripts/github_pr_feedback.py "${args[@]}"
+          echo "submitted=true" >> "$GITHUB_OUTPUT"
+          echo "analysis_id=$($PYTHON_CMD -c 'import json; print(json.load(open("cloudpilot-result.json"))["id"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Retain prediction association
+        if: steps.cloudpilot.outputs.submitted == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudpilot-analysis-${{ github.run_id }}
+          path: cloudpilot-result.json
+          retention-days: 30
+
+      - name: Publish prediction association
+        if: steps.cloudpilot.outputs.submitted == 'true'
+        shell: bash
+        run: |
+          echo "### CloudPilot prediction association" >> "$GITHUB_STEP_SUMMARY"
+          echo "CloudPilot analysis ID: \`${{ steps.cloudpilot.outputs.analysis_id }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Download artifact \`cloudpilot-analysis-${{ github.run_id }}\` when recording the deployed outcome." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Add pull-request comment
+        if: steps.cloudpilot.outputs.submitted == 'true' && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const result = JSON.parse(fs.readFileSync('cloudpilot-result.json', 'utf8'));
+            const findings = result.findings.length
+              ? result.findings.map(item => `- **${item.id}**: ${item.message}`).join('\n')
+              : '- No policy violations';
+            const body = `## ☁️ CloudPilot change review\n\n**CloudPilot analysis:** #${result.id} · GitHub run ${{ github.run_id }}\n**Decision:** ${result.decision}\n**Composite risk:** ${result.risk.score}/100 — ${result.risk.label}\n**Estimated monthly delta:** $${result.monthly_cost_delta.toFixed(2)}\n**Blast radius:** ${result.blast_radius.direct_dependencies} direct, ${result.blast_radius.indirect_dependencies} indirect, ${result.blast_radius.tier1_services} Tier-1 services\n\n### Findings\n${findings}\n\n${result.explanation}`;
+            await github.rest.issues.createComment({owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body});
+
+      - name: Fail gate for blocked changes
+        if: steps.cloudpilot.outputs.submitted == 'true'
+        shell: bash
+        run: |
+          PYTHON_CMD="python"
+          if [ -f ".venv/bin/python" ]; then
+            PYTHON_CMD=".venv/bin/python"
+          fi
+          decision="$($PYTHON_CMD -c "import json; print(json.load(open('cloudpilot-result.json'))['decision'])")"
+          test "$decision" != "BLOCK"
