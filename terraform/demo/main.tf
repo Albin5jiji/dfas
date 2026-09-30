@@ -17,7 +17,7 @@ provider "aws" {
 
 resource "aws_instance" "cloudpilot_demo" {
   ami           = "ami-06cfeaaa22092f09d"
-  instance_type = "t3.small"
+  instance_type = "t3.micro"
   subnet_id     = "subnet-0a7a1728a66d078a1"
 
   tags = {
